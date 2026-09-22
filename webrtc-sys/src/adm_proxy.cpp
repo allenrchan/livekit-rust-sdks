@@ -535,6 +535,14 @@ int32_t AdmProxy::StartPlayout() {
     }
     // Synthetic mode
     if (synthetic_adm_) {
+      // WebRTC terminates the ADM after the final receive stream closes. A
+      // retained PeerConnectionFactory can then create another receive stream,
+      // but StartPlayout alone only flips SyntheticAudioDevice::playing_ and
+      // does not recreate the terminated audio queue. Reinitialize the
+      // synthetic pump before restarting it so sequential rooms receive audio.
+      if (!synthetic_adm_->Initialized() && synthetic_adm_->Init() != 0) {
+        return -1;
+      }
       return synthetic_adm_->StartPlayout();
     }
     return -1;
