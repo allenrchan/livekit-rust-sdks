@@ -39,8 +39,121 @@ use livekit_net::{
 };
 use livekit_protocol as proto;
 use prost::Message as _;
-use std::sync::{Arc, Once};
-use tokio::sync::Mutex as AsyncMutex;
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex, Once, OnceLock, Weak,
+    },
+};
+use tokio::sync::{watch, Mutex as AsyncMutex};
+
+/// One observed AddTrack transport write, excluding its protobuf body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteAttempt {
+    pub cid: String,
+    pub failed: bool,
+}
+
+/// External transport state shared only by one test's connection generations.
+struct WriteProbeState {
+    fail_next: AtomicBool,
+    fail_cid: Option<String>,
+    attempts: Mutex<Vec<WriteAttempt>>,
+}
+
+/// Owns a URL-selected external write fault and unregisters it on drop.
+pub struct WriteProbe {
+    id: String,
+    state: Arc<WriteProbeState>,
+}
+
+impl WriteProbe {
+    /// URL recognized only by the already-installed shared mock transport.
+    pub fn url(&self) -> String {
+        format!("wss://localhost:7880/rtc?write_probe={}", self.id)
+    }
+
+    /// Snapshot of actual AddTrack calls to the external connection.
+    pub fn attempts(&self) -> Vec<WriteAttempt> {
+        self.state.attempts.lock().expect("write probe attempts").clone()
+    }
+}
+
+impl Drop for WriteProbe {
+    fn drop(&mut self) {
+        write_probes().lock().expect("write probe registry").remove(&self.id);
+    }
+}
+
+/// Weak registrations let the shared dispatcher select a per-test connection.
+fn write_probes() -> &'static Mutex<HashMap<String, Weak<WriteProbeState>>> {
+    static PROBES: OnceLock<Mutex<HashMap<String, Weak<WriteProbeState>>>> = OnceLock::new();
+    PROBES.get_or_init(Mutex::default)
+}
+
+/// Fail the first AddTrack write, then allow a fresh connection to deliver.
+pub fn connection_write_probe() -> WriteProbe {
+    register_write_probe(None)
+}
+
+/// Fail one selected AddTrack identity after any successful prefix.
+pub fn connection_write_probe_for_cid(cid: &str) -> WriteProbe {
+    register_write_probe(Some(cid.to_owned()))
+}
+
+/// Register one URL-owned failure plan without replacing the shared transport.
+fn register_write_probe(fail_cid: Option<String>) -> WriteProbe {
+    static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed).to_string();
+    let state = Arc::new(WriteProbeState {
+        fail_next: AtomicBool::new(true),
+        fail_cid,
+        attempts: Mutex::new(Vec::new()),
+    });
+    write_probes().lock().expect("write probe registry").insert(id.clone(), Arc::downgrade(&state));
+    WriteProbe { id, state }
+}
+
+/// Unlike the ordinary canned mock, receive stays pending until explicit close.
+struct WriteProbeConn {
+    state: Arc<WriteProbeState>,
+    closed: watch::Sender<bool>,
+}
+
+#[async_trait::async_trait]
+impl WsConnection for WriteProbeConn {
+    async fn send(&self, frame: Vec<u8>) -> Result<(), TransportError> {
+        let request = proto::SignalRequest::decode(frame.as_slice())
+            .map_err(|_| TransportError::Other("invalid write probe request".into()))?;
+        if let Some(proto::signal_request::Message::AddTrack(track)) = request.message {
+            let selected = self.state.fail_cid.as_ref().is_none_or(|cid| *cid == track.cid);
+            let failed = selected && self.state.fail_next.swap(false, Ordering::AcqRel);
+            self.state
+                .attempts
+                .lock()
+                .expect("write probe attempts")
+                .push(WriteAttempt { cid: track.cid, failed });
+            if failed {
+                return Err(TransportError::Connection("write probe connection failure".into()));
+            }
+        }
+        Ok(())
+    }
+
+    async fn recv(&self) -> Result<Option<Vec<u8>>, TransportError> {
+        let mut closed = self.closed.subscribe();
+        let already_closed = *closed.borrow();
+        if !already_closed {
+            let _ = closed.changed().await;
+        }
+        Ok(None)
+    }
+
+    async fn close(&self) {
+        self.closed.send_replace(true);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // MockConn: yields one canned Pong frame then None
@@ -73,10 +186,21 @@ pub struct MockTransport;
 impl WsClient for MockTransport {
     async fn connect(
         &self,
-        _url: String,
+        url: String,
         _headers: Vec<Header>,
         _timeout_ms: u64,
     ) -> Result<WsConnectResult, TransportError> {
+        if let Some(id) = url.strip_prefix("wss://localhost:7880/rtc?write_probe=") {
+            let state = write_probes()
+                .lock()
+                .expect("write probe registry")
+                .get(id)
+                .and_then(Weak::upgrade)
+                .ok_or_else(|| TransportError::Connection("unregistered write probe".into()))?;
+            return Ok(WsConnectResult {
+                connection: Arc::new(WriteProbeConn { state, closed: watch::channel(false).0 }),
+            });
+        }
         let pong = proto::SignalResponse {
             message: Some(proto::signal_response::Message::PongResp(proto::Pong::default())),
         };

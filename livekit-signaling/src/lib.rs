@@ -16,6 +16,7 @@
 
 use std::{
     borrow::Cow,
+    collections::VecDeque,
     fmt::Debug,
     io::Write,
     sync::{
@@ -209,7 +210,7 @@ struct SignalInner {
     stream: AsyncRwLock<Option<SignalStream>>,
     token: Mutex<String>, // Token can be refreshed
     reconnecting: AtomicBool,
-    queue: AsyncMutex<Vec<proto::signal_request::Message>>,
+    queue: AsyncMutex<VecDeque<proto::signal_request::Message>>,
     url: String,
     options: SignalOptions,
     join_response: proto::JoinResponse,
@@ -635,54 +636,74 @@ impl SignalInner {
     ///   [`Self::set_reconnected`] after the resume has fully recovered.
     pub async fn send(&self, signal: proto::signal_request::Message) {
         let pass_through = is_pass_through(&signal);
-        let reconnecting = self.reconnecting.load(Ordering::Acquire);
+        if !pass_through && self.reconnecting.load(Ordering::Acquire) {
+            let mut queue = self.queue.lock().await;
+            // Resume may have completed while we waited for the queue. Recheck
+            // under its lock so this cannot enqueue after the final flush.
+            if self.reconnecting.load(Ordering::Acquire) {
+                queue.push_back(signal);
+                return;
+            }
+        }
 
-        if reconnecting && !pass_through {
-            // Queueable signal during reconnect — buffer for the post-resume flush.
-            self.queue.lock().await.push(signal);
+        // Adopt the stream-before-queue lock discipline from upstream #1402
+        // (d66d86f1). Never acquire the stream while holding the queue: a fair
+        // RwLock with a pending restart writer can otherwise deadlock senders.
+        let stream = self.stream.read().await;
+
+        if !pass_through {
+            let mut queue = self.queue.lock().await;
+            // Direct and held requests use one serialized FIFO. Retain the
+            // head until its write succeeds, regardless of the transport error
+            // variant; a later send cannot bypass a previously failed request.
+            queue.push_back(signal);
+            // As on the reconnect fast path, sample the flag under this lock;
+            // the resume's final flush may have finished before we acquired it.
+            if !self.reconnecting.load(Ordering::Acquire) {
+                if let Some(stream) = stream.as_ref() {
+                    Self::flush_pending(&mut queue, stream).await;
+                }
+            }
             return;
         }
 
-        if !reconnecting {
-            // Normal path: drain anything that was queued before the previous
-            // reconnect, preserving the original send order.
-            self.flush_queue().await;
-        }
-
-        // Pass-through during reconnect: the stream read lock is held by `restart`
-        // until the new stream is installed, so this awaits and then writes via
-        // the new stream. Same code path for the steady-state send — the lock is
-        // free and we send immediately.
-        if let Some(stream) = self.stream.read().await.as_ref() {
-            if let Err(SignalError::SendError) = stream.send(signal.clone()).await {
-                if !pass_through {
-                    self.queue.lock().await.push(signal);
-                } else {
-                    log::warn!("dropping pass-through signal — send failed");
-                }
+        // Negotiation signals must still pass through during reconnect; they
+        // cannot be queued without preventing the resume itself from finishing.
+        if let Some(stream) = stream.as_ref() {
+            if !self.reconnecting.load(Ordering::Acquire) {
+                let mut queue = self.queue.lock().await;
+                Self::flush_pending(&mut queue, stream).await;
             }
-        } else if !pass_through {
-            // Stream not in place AND signal is queueable — hold it.
-            self.queue.lock().await.push(signal);
+            if stream.send(signal).await.is_err() {
+                log::warn!("dropping pass-through signal — send failed");
+            }
         } else {
             log::warn!("dropping pass-through signal — no stream available");
         }
     }
 
     pub async fn flush_queue(&self) {
-        let mut queue = self.queue.lock().await;
-        if queue.is_empty() {
-            return;
+        let stream = self.stream.read().await;
+        if let Some(stream) = stream.as_ref() {
+            let mut queue = self.queue.lock().await;
+            Self::flush_pending(&mut queue, stream).await;
         }
+    }
 
-        if let Some(stream) = self.stream.read().await.as_ref() {
-            for signal in queue.drain(..) {
-                // log::warn!("sending queued signal: {:?}", signal);
-
-                if let Err(err) = stream.send(signal).await {
-                    log::error!("failed to send queued signal: {}", err); // Lost message
-                }
+    /// Drain a FIFO while its caller owns stream then queue. The async queue
+    /// lock serializes writes; no synchronous lock is held across an await.
+    /// Remove each successful head immediately, preserving the remaining queue
+    /// on write failure or cancellation instead of dropping an in-flight Drain.
+    async fn flush_pending(
+        queue: &mut VecDeque<proto::signal_request::Message>,
+        stream: &SignalStream,
+    ) {
+        while let Some(signal) = queue.front() {
+            if let Err(err) = stream.send(signal.clone()).await {
+                log::error!("failed to send queued signal; retaining unsent requests: {}", err);
+                break;
             }
+            queue.pop_front();
         }
     }
 
@@ -1295,6 +1316,177 @@ mod tests {
         .await
         .expect("the mock transport always connects")
         .0
+    }
+
+    /// Opens a real SignalStream over this test's URL-selected external fault.
+    async fn write_probe_stream(probe: &crate::test_transport::WriteProbe) -> SignalStream {
+        crate::test_transport::install_mock_transport();
+        SignalStream::connect(
+            url::Url::parse(&probe.url()).expect("write probe URL"),
+            "",
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("write probe transport connects")
+        .0
+    }
+
+    /// AddTrack requests used to correlate a retained queue with socket writes.
+    fn add_track(cid: &str) -> proto::signal_request::Message {
+        proto::signal_request::Message::AddTrack(proto::AddTrackRequest {
+            cid: cid.into(),
+            ..Default::default()
+        })
+    }
+
+    /// Snapshot of queued AddTrack identities in FIFO order.
+    async fn queued_track_cids(inner: &Arc<SignalInner>) -> Vec<String> {
+        inner
+            .queue
+            .lock()
+            .await
+            .iter()
+            .filter_map(|signal| match signal {
+                proto::signal_request::Message::AddTrack(track) => Some(track.cid.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Stops and joins the stream's existing read/write tasks before assertions.
+    async fn close_test_stream(inner: &Arc<SignalInner>) {
+        let stream = inner.stream.write().await.take();
+        if let Some(stream) = stream {
+            stream.close(true).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_write_failure_retains_direct_add_track() {
+        use crate::test_transport::{connection_write_probe, WriteAttempt};
+
+        let probe = connection_write_probe();
+        let inner = make_stub_inner();
+        *inner.stream.write().await = Some(write_probe_stream(&probe).await);
+
+        inner.send(add_track("direct-write-cid")).await;
+        let queued_after_failure = queued_track_cids(&inner).await;
+        let attempts = probe.attempts();
+        close_test_stream(&inner).await;
+
+        assert_eq!(
+            attempts,
+            vec![WriteAttempt { cid: "direct-write-cid".into(), failed: true }],
+            "the external connection must fail the exact AddTrack write, not close before it"
+        );
+        assert_eq!(
+            queued_after_failure,
+            vec!["direct-write-cid"],
+            "a mapped connection error must retain the exact queueable AddTrack"
+        );
+    }
+
+    #[tokio::test]
+    async fn transport_write_failure_retains_flush_fifo_until_fresh_connection() {
+        use crate::test_transport::{connection_write_probe, WriteAttempt};
+
+        let probe = connection_write_probe();
+        let inner = make_stub_inner();
+        inner.reconnecting.store(true, Ordering::Release);
+        inner.send(add_track("first-write-cid")).await;
+        inner.send(add_track("second-write-cid")).await;
+        *inner.stream.write().await = Some(write_probe_stream(&probe).await);
+
+        inner.set_reconnected().await;
+        let queued_after_failure = queued_track_cids(&inner).await;
+        let failed_attempts = probe.attempts();
+        close_test_stream(&inner).await;
+
+        *inner.stream.write().await = Some(write_probe_stream(&probe).await);
+        inner.flush_queue().await;
+        let queued_after_recovery = queued_track_cids(&inner).await;
+        let all_attempts = probe.attempts();
+        close_test_stream(&inner).await;
+
+        assert_eq!(
+            failed_attempts,
+            vec![WriteAttempt { cid: "first-write-cid".into(), failed: true }],
+            "only the first queued AddTrack reaches the failed external connection"
+        );
+        assert_eq!(
+            queued_after_failure,
+            vec!["first-write-cid", "second-write-cid"],
+            "failed flush must retain the failed request and unsent remainder in FIFO order"
+        );
+        assert_eq!(
+            all_attempts,
+            vec![
+                WriteAttempt { cid: "first-write-cid".into(), failed: true },
+                WriteAttempt { cid: "first-write-cid".into(), failed: false },
+                WriteAttempt { cid: "second-write-cid".into(), failed: false },
+            ],
+            "a fresh healthy connection must deliver each retained request exactly once in order"
+        );
+        assert!(queued_after_recovery.is_empty(), "successful writes must drain the queue");
+    }
+
+    #[tokio::test]
+    async fn transport_write_failure_preserves_successful_prefix_and_later_send_order() {
+        use crate::test_transport::{connection_write_probe_for_cid, WriteAttempt};
+
+        let probe = connection_write_probe_for_cid("B-failed-cid");
+        let inner = make_stub_inner();
+        inner.reconnecting.store(true, Ordering::Release);
+        inner.send(add_track("A-successful-cid")).await;
+        inner.send(add_track("B-failed-cid")).await;
+        inner.send(add_track("C-unsent-cid")).await;
+        *inner.stream.write().await = Some(write_probe_stream(&probe).await);
+
+        inner.set_reconnected().await;
+        let queued_after_failure = queued_track_cids(&inner).await;
+        let prefix_attempts = probe.attempts();
+        close_test_stream(&inner).await;
+
+        // A new queueable request cannot overtake the failed request or its
+        // unsent remainder while there is no healthy transport.
+        inner.send(add_track("D-later-cid")).await;
+        let queued_after_later_send = queued_track_cids(&inner).await;
+        *inner.stream.write().await = Some(write_probe_stream(&probe).await);
+        inner.flush_queue().await;
+        let queued_after_recovery = queued_track_cids(&inner).await;
+        let all_attempts = probe.attempts();
+        close_test_stream(&inner).await;
+
+        assert_eq!(
+            prefix_attempts,
+            vec![
+                WriteAttempt { cid: "A-successful-cid".into(), failed: false },
+                WriteAttempt { cid: "B-failed-cid".into(), failed: true },
+            ],
+            "A must succeed and B must fail at the external write, leaving C unsent"
+        );
+        assert_eq!(
+            queued_after_failure,
+            vec!["B-failed-cid", "C-unsent-cid"],
+            "successful A must leave the queue while failed B and unsent C remain"
+        );
+        assert_eq!(
+            queued_after_later_send,
+            vec!["B-failed-cid", "C-unsent-cid", "D-later-cid"],
+            "later D must queue behind the retained B/C remainder"
+        );
+        assert_eq!(
+            all_attempts,
+            vec![
+                WriteAttempt { cid: "A-successful-cid".into(), failed: false },
+                WriteAttempt { cid: "B-failed-cid".into(), failed: true },
+                WriteAttempt { cid: "B-failed-cid".into(), failed: false },
+                WriteAttempt { cid: "C-unsent-cid".into(), failed: false },
+                WriteAttempt { cid: "D-later-cid".into(), failed: false },
+            ],
+            "recovery must deliver B/C/D exactly once in order without replaying A"
+        );
+        assert!(queued_after_recovery.is_empty(), "successful recovery must drain the queue");
     }
 
     #[tokio::test]
