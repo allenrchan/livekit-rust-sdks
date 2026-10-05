@@ -108,7 +108,6 @@ enum NegotiationState {
 struct NegotiationQueue {
     state: Arc<Mutex<NegotiationState>>,
     waker: Arc<Notify>,
-    task_running: AtomicBool,
     waiting_for_answer: AtomicBool,
 }
 
@@ -117,8 +116,40 @@ impl NegotiationQueue {
         Self {
             state: Arc::new(Mutex::new(NegotiationState::Idle)),
             waker: Arc::new(Notify::new()),
-            task_running: AtomicBool::new(false),
             waiting_for_answer: AtomicBool::new(false),
+        }
+    }
+
+    /// Claim the negotiation task or coalesce work into its next round.
+    fn claim_task(&self) -> bool {
+        let mut state = self.state.lock();
+        match *state {
+            NegotiationState::Idle => {
+                // State and task ownership must change under one lock. An
+                // independent running flag leaves a request between Idle and
+                // async task exit waiting on an owner that cannot retry it.
+                *state = NegotiationState::InProgress;
+                true
+            }
+            NegotiationState::InProgress | NegotiationState::PendingRetry => {
+                *state = NegotiationState::PendingRetry;
+                false
+            }
+        }
+    }
+
+    /// Complete the current round, retaining ownership only for pending work.
+    fn complete_round(&self) -> bool {
+        let mut state = self.state.lock();
+        match *state {
+            NegotiationState::PendingRetry => {
+                *state = NegotiationState::InProgress;
+                true
+            }
+            _ => {
+                *state = NegotiationState::Idle;
+                false
+            }
         }
     }
 }
@@ -2497,33 +2528,11 @@ impl SessionInner {
     }
 
     fn queue_negotiation(self: &Arc<Self>) {
-        let mut state = self.negotiation_queue.state.lock();
-
-        match *state {
-            NegotiationState::Idle => {
-                if self.negotiation_queue.task_running.swap(true, Ordering::AcqRel) {
-                    log::debug!("queue_negotiation: task already running, marking for retry");
-                    *state = NegotiationState::PendingRetry;
-                    return;
-                }
-
-                log::debug!("queue_negotiation: starting new negotiation");
-                *state = NegotiationState::InProgress;
-                drop(state);
-
-                let session = self.clone();
-                tokio::spawn(async move {
-                    session.execute_negotiation_with_retry().await;
-                    session.negotiation_queue.task_running.store(false, Ordering::Release);
-                });
-            }
-            NegotiationState::InProgress => {
-                log::debug!("queue_negotiation: marking for retry");
-                *state = NegotiationState::PendingRetry;
-            }
-            NegotiationState::PendingRetry => {
-                log::debug!("queue_negotiation: already pending retry");
-            }
+        if self.negotiation_queue.claim_task() {
+            let session = self.clone();
+            tokio::spawn(async move {
+                session.execute_negotiation_with_retry().await;
+            });
         }
     }
 
@@ -2554,20 +2563,12 @@ impl SessionInner {
                 }
             }
 
-            let mut state = self.negotiation_queue.state.lock();
-            match *state {
-                NegotiationState::PendingRetry => {
-                    log::debug!("retrying negotiation");
-                    *state = NegotiationState::InProgress;
-                    drop(state);
-                    continue;
-                }
-                _ => {
-                    log::debug!("negotiation completed");
-                    *state = NegotiationState::Idle;
-                    break;
-                }
+            if self.negotiation_queue.complete_round() {
+                log::debug!("retrying negotiation");
+                continue;
             }
+            log::debug!("negotiation completed");
+            break;
         }
     }
 
@@ -2808,7 +2809,36 @@ make_rtc_config!(make_rtc_config_reconnect, proto::ReconnectResponse);
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_sdp_max_message_size, recovery_decision, DEFAULT_MAX_MESSAGE_SIZE};
+    use super::{
+        parse_sdp_max_message_size, recovery_decision, NegotiationQueue, NegotiationState,
+        DEFAULT_MAX_MESSAGE_SIZE,
+    };
+
+    #[test]
+    fn completed_negotiation_cannot_strand_the_next_task() {
+        let queue = NegotiationQueue::new();
+        assert!(queue.claim_task());
+        assert!(!queue.complete_round());
+        // Reproduce an incoming request after Idle becomes visible, but before
+        // the exiting async task executes its old trailing task_running clear.
+        assert!(
+            queue.claim_task(),
+            "a request after completion must own a new task, not wait on an exiting owner"
+        );
+        assert!(matches!(*queue.state.lock(), NegotiationState::InProgress));
+    }
+
+    #[test]
+    fn in_flight_negotiation_requests_coalesce_into_one_followup_round() {
+        let queue = NegotiationQueue::new();
+        assert!(queue.claim_task());
+        assert!(!queue.claim_task());
+        assert!(!queue.claim_task());
+        assert!(queue.complete_round());
+        assert!(matches!(*queue.state.lock(), NegotiationState::InProgress));
+        assert!(!queue.complete_round());
+        assert!(matches!(*queue.state.lock(), NegotiationState::Idle));
+    }
 
     /// `(connected, disconnect)` counts as sampled before a resume, for readability below.
     const SNAPSHOT: Option<(u32, u32)> = Some((7, 3));
