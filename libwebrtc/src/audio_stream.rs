@@ -90,6 +90,16 @@ pub mod native {
             self.handle.track()
         }
 
+        /// Returns the number of decoded frames discarded by queue overflow.
+        ///
+        /// This cumulative stream-local counter does not reset when frames are
+        /// consumed or [`Self::close`] is called. It excludes network loss and
+        /// frames discarded by explicit shutdown.
+        #[must_use]
+        pub fn dropped_frames(&self) -> u64 {
+            self.handle.dropped_frames()
+        }
+
         pub fn close(&mut self) {
             self.handle.close()
         }
