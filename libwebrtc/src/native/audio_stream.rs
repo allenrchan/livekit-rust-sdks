@@ -61,6 +61,11 @@ impl NativeAudioStream {
         self.audio_track.clone()
     }
 
+    /// Observes cumulative queue-overflow losses without resetting them.
+    pub fn dropped_frames(&self) -> u64 {
+        self.frame_queue.dropped_frames()
+    }
+
     pub fn close(&mut self) {
         let audio = unsafe { sys_at::ffi::media_to_audio(self.audio_track.sys_handle()) };
         audio.remove_sink(&self.native_sink);
@@ -140,6 +145,11 @@ impl AudioFrameQueue {
             dropped_frames: AtomicU64::new(0),
             waker: Mutex::new(None),
         }
+    }
+
+    /// Observes cumulative queue-overflow losses without consuming a frame.
+    fn dropped_frames(&self) -> u64 {
+        self.dropped_frames.load(Ordering::Relaxed)
     }
 
     fn push(&self, frame: AudioFrame<'static>) {
@@ -284,6 +294,26 @@ mod tests {
         assert_eq!(pop_marker(&queue), Some(2));
         assert_eq!(pop_marker(&queue), Some(3));
         assert_eq!(pop_marker(&queue), None);
+    }
+
+    #[test]
+    fn capture_loss_remains_observable_after_queue_drain_and_close() {
+        // Consumers need the public stream observation before accepting PCM;
+        // log messages alone cannot make a successful turn loss-aware.
+        let _public_observation: fn(&crate::audio_stream::native::NativeAudioStream) -> u64 =
+            crate::audio_stream::native::NativeAudioStream::dropped_frames;
+        let queue = AudioFrameQueue::new(Some(2));
+        assert_eq!(queue.dropped_frames(), 0);
+        queue.push(test_frame(1));
+        queue.push(test_frame(2));
+        queue.push(test_frame(3));
+        assert_eq!(queue.dropped_frames(), 1);
+        assert_eq!(pop_marker(&queue), Some(2));
+        assert_eq!(pop_marker(&queue), Some(3));
+        assert_eq!(queue.dropped_frames(), 1);
+        queue.close();
+        queue.push(test_frame(4));
+        assert_eq!(queue.dropped_frames(), 1);
     }
 
     #[test]
