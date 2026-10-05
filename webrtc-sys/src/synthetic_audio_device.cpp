@@ -55,7 +55,9 @@ int32_t SyntheticAudioDevice::Init() {
       webrtc::RepeatingTaskHandle::Start(audio_queue_.get(), [this]() {
         webrtc::MutexLock lock(&mutex_);
 
-        if (playing_) {
+        // WebRTC may start playout before registration or unregister its
+        // transport while the retained factory's pump is still enabled.
+        if (playing_ && audio_transport_) {
           int64_t elapsed_time_ms = -1;
           int64_t ntp_time_ms = -1;
           size_t n_samples_out = 0;
