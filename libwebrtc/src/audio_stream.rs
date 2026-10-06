@@ -48,6 +48,30 @@ pub mod native {
         pub queue_size_frames: Option<usize>,
     }
 
+    /// Stream-local observations of decoded sink delivery and queue residence.
+    ///
+    /// Fields are sampled independently while capture may continue. Durations
+    /// use the process monotonic clock, not RTP timestamps or network latency.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct NativeAudioStreamQueueStats {
+        /// Frames submitted by the native sink before shutdown.
+        pub received_frames: u64,
+        /// Frames returned to the stream reader, excluding overflow eviction.
+        pub delivered_frames: u64,
+        /// Frames discarded by overflow, excluding explicit shutdown.
+        pub dropped_frames: u64,
+        /// Frames currently available to the reader.
+        pub queued_frames: usize,
+        /// Longest interval between decoded sink callbacks, including silence.
+        pub max_callback_gap_ms: u64,
+        /// Longest callback-to-reader residence among delivered frames.
+        pub max_frame_residence_ms: u64,
+        /// Current age of the oldest queued frame, or zero when empty.
+        pub oldest_queued_frame_age_ms: u64,
+        /// Time since the latest decoded callback; absent before first capture.
+        pub last_callback_age_ms: Option<u64>,
+    }
+
     pub struct NativeAudioStream {
         pub(crate) handle: stream_imp::NativeAudioStream,
     }
@@ -88,6 +112,22 @@ pub mod native {
 
         pub fn track(&self) -> RtcAudioTrack {
             self.handle.track()
+        }
+
+        /// Returns the number of decoded frames discarded by queue overflow.
+        ///
+        /// This cumulative stream-local counter does not reset when frames are
+        /// consumed or [`Self::close`] is called. It excludes network loss and
+        /// frames discarded by explicit shutdown.
+        #[must_use]
+        pub fn dropped_frames(&self) -> u64 {
+            self.handle.dropped_frames()
+        }
+
+        /// Observes queue timing without consuming PCM or resetting counters.
+        #[must_use]
+        pub fn queue_stats(&self) -> NativeAudioStreamQueueStats {
+            self.handle.queue_stats()
         }
 
         pub fn close(&mut self) {

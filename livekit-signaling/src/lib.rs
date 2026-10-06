@@ -728,6 +728,11 @@ async fn signal_task(
 
     loop {
         tokio::select! {
+            _ = emitter.closed() => {
+                // Session setup was abandoned before the events receiver was adopted.
+                // Settle through the existing joined stream cleanup below.
+                break;
+            }
             signal = internal_events.recv() => {
                 if let Some(signal) = signal {
                     // Received a message from the server
@@ -1359,6 +1364,54 @@ mod tests {
         if let Some(stream) = stream {
             stream.close(true).await;
         }
+    }
+
+    /// Abandoned session setup must release its middleware and joined socket tasks.
+    #[tokio::test]
+    async fn dropped_signal_events_settle_middleware_and_release_inner() {
+        use crate::test_transport::connection_write_probe;
+
+        let probe = connection_write_probe();
+        crate::test_transport::install_mock_transport();
+        let (stream, internal_events) = SignalStream::connect(
+            url::Url::parse(&probe.url()).expect("lifecycle probe URL"),
+            "",
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("lifecycle probe transport connects");
+        let inner = make_stub_inner_with(proto::JoinResponse {
+            ping_interval: 60,
+            ping_timeout: 60,
+            ..Default::default()
+        });
+        *inner.stream.write().await = Some(stream);
+        let weak_inner = Arc::downgrade(&inner);
+        let (emitter, events) = mpsc::unbounded_channel();
+        let middleware = tokio::spawn(signal_task(inner.clone(), emitter.clone(), internal_events));
+        let client = SignalClient { inner, emitter, handle: Mutex::new(Some(middleware)) };
+        // Keep the existing task handle as the test supervisor, not a new cleanup task.
+        let mut middleware = client.handle.lock().take().expect("owned middleware handle");
+        drop(client);
+        drop(events);
+
+        let completed = match tokio::time::timeout(Duration::from_secs(5), &mut middleware).await {
+            Ok(result) => {
+                result.expect("join middleware after receiver drop");
+                true
+            }
+            Err(_) => {
+                // A failing RED must still close and join every fixture-owned task.
+                if let Some(inner) = weak_inner.upgrade() {
+                    inner.close(true).await;
+                }
+                middleware.await.expect("join middleware after explicit RED cleanup");
+                false
+            }
+        };
+
+        assert!(weak_inner.upgrade().is_none(), "joined middleware must release SignalInner");
+        assert!(completed, "dropping SignalEvents must settle middleware before its ping timeout");
     }
 
     #[tokio::test]

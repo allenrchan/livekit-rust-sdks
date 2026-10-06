@@ -108,7 +108,6 @@ enum NegotiationState {
 struct NegotiationQueue {
     state: Arc<Mutex<NegotiationState>>,
     waker: Arc<Notify>,
-    task_running: AtomicBool,
     waiting_for_answer: AtomicBool,
 }
 
@@ -117,8 +116,40 @@ impl NegotiationQueue {
         Self {
             state: Arc::new(Mutex::new(NegotiationState::Idle)),
             waker: Arc::new(Notify::new()),
-            task_running: AtomicBool::new(false),
             waiting_for_answer: AtomicBool::new(false),
+        }
+    }
+
+    /// Claim the negotiation task or coalesce work into its next round.
+    fn claim_task(&self) -> bool {
+        let mut state = self.state.lock();
+        match *state {
+            NegotiationState::Idle => {
+                // State and task ownership must change under one lock. An
+                // independent running flag leaves a request between Idle and
+                // async task exit waiting on an owner that cannot retry it.
+                *state = NegotiationState::InProgress;
+                true
+            }
+            NegotiationState::InProgress | NegotiationState::PendingRetry => {
+                *state = NegotiationState::PendingRetry;
+                false
+            }
+        }
+    }
+
+    /// Complete the current round, retaining ownership only for pending work.
+    fn complete_round(&self) -> bool {
+        let mut state = self.state.lock();
+        match *state {
+            NegotiationState::PendingRetry => {
+                *state = NegotiationState::InProgress;
+                true
+            }
+            _ => {
+                *state = NegotiationState::Idle;
+                false
+            }
         }
     }
 }
@@ -511,6 +542,125 @@ struct SessionHandle {
     dt_sender_task: JoinHandle<()>,
 }
 
+/// Prepare one native peer without taking ownership of signaling or room tasks.
+async fn prepare_peer_transport(
+    runtime: Arc<LkRuntime>,
+    config: RtcConfiguration,
+    target: SignalTarget,
+    single_pc_mode: bool,
+) -> EngineResult<UncommittedPeer<PeerTransport>> {
+    prepare_native_connection(move || {
+        let peer = PeerTransport::new(
+            runtime.pc_factory().create_peer_connection(config)?,
+            target,
+            single_pc_mode,
+        );
+        Ok(UncommittedPeer::new(peer, PeerTransport::close, Some(runtime)))
+    })
+    .await
+}
+
+/// Execute the synchronous native constructor with its owned inputs.
+#[cfg(not(target_arch = "wasm32"))]
+async fn prepare_native_connection<T: Send + 'static>(
+    prepare: impl FnOnce() -> EngineResult<T> + Send + 'static,
+) -> EngineResult<T> {
+    static ADMISSION: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    let admission = Arc::clone(ADMISSION.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1))));
+    prepare_native_connection_with_admission(admission, prepare).await
+}
+
+/// Bound native constructor jobs, not active rooms or connection capacity.
+#[cfg(not(target_arch = "wasm32"))]
+async fn prepare_native_connection_with_admission<T: Send + 'static>(
+    admission: Arc<tokio::sync::Semaphore>,
+    prepare: impl FnOnce() -> EngineResult<T> + Send + 'static,
+) -> EngineResult<T> {
+    let permit = admission.acquire_owned().await.map_err(|error| {
+        EngineError::Internal(format!("native peer preparation admission failed: {error}").into())
+    })?;
+    let mut pending = NativePreparationTask {
+        task: tokio::task::spawn_blocking(move || {
+            // A started native call cannot be aborted. Keep admission and all
+            // constructor inputs until it returns; normal Tokio runtime shutdown
+            // joins it. Caller Drop alone does not join started blocking work.
+            let _permit = permit;
+            prepare()
+        }),
+    };
+    (&mut pending.task).await.map_err(|_| {
+        // JoinError can contain arbitrary panic text; retain a fixed classification.
+        EngineError::Internal("native peer preparation task failed".into())
+    })?
+}
+
+/// Abort queued construction without spawning an unowned cleanup task.
+#[cfg(not(target_arch = "wasm32"))]
+struct NativePreparationTask<T> {
+    task: JoinHandle<EngineResult<T>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<T> Drop for NativePreparationTask<T> {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Close an unadopted peer while retaining its native runtime/factory owner.
+struct UncommittedPeer<T> {
+    peer: Option<T>,
+    close: fn(&T),
+    // This is an ownership edge, not a callback back-reference. It remains
+    // alive through explicit native close and destruction of the peer below.
+    _runtime: Option<Arc<LkRuntime>>,
+}
+
+impl<T> UncommittedPeer<T> {
+    /// Own one prepared peer until the session adopts it or setup is abandoned.
+    fn new(peer: T, close: fn(&T), runtime: Option<Arc<LkRuntime>>) -> Self {
+        Self { peer: Some(peer), close, _runtime: runtime }
+    }
+
+    /// Transfer the prepared peer exactly once into normal session ownership.
+    fn adopt(mut self) -> T {
+        self.peer.take().expect("uncommitted peer is present until consuming adoption")
+    }
+}
+
+impl<T> std::ops::Deref for UncommittedPeer<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.peer.as_ref().expect("uncommitted peer remains present while borrowed")
+    }
+}
+
+impl<T> std::ops::DerefMut for UncommittedPeer<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.peer.as_mut().expect("uncommitted peer remains present while mutably borrowed")
+    }
+}
+
+impl<T> Drop for UncommittedPeer<T> {
+    fn drop(&mut self) {
+        if let Some(peer) = self.peer.take() {
+            // Native close is synchronous, as in existing PeerTransport teardown.
+            // This may run on the result-dropping thread; it is not a blocking
+            // join barrier and must not be hidden behind detached cleanup.
+            (self.close)(&peer);
+        }
+    }
+}
+
+/// Browser peer constructors remain on their existing JavaScript thread.
+#[cfg(target_arch = "wasm32")]
+async fn prepare_native_connection<T>(
+    prepare: impl FnOnce() -> EngineResult<T>,
+) -> EngineResult<T> {
+    prepare()
+}
+
 impl RtcSession {
     /// Connect to a LiveKit room.
     pub async fn connect(
@@ -530,11 +680,13 @@ impl RtcSession {
 
         let mut publisher_offer = None;
         let early_publisher_pc = if use_single_pc {
-            let publisher_pc = PeerTransport::new(
-                lk_runtime.pc_factory().create_peer_connection(options.rtc_config.clone())?,
+            let publisher_pc = prepare_peer_transport(
+                Arc::clone(&lk_runtime),
+                options.rtc_config.clone(),
                 proto::SignalTarget::Publisher,
                 true,
-            );
+            )
+            .await?;
 
             let dcs = Self::create_data_channels(&publisher_pc, &emitter)?;
 
@@ -600,11 +752,13 @@ impl RtcSession {
                 (pub_pc, dcs.0, dcs.1, dcs.2)
             } else {
                 sent_publisher_offer = false;
-                let publisher_pc = PeerTransport::new(
-                    lk_runtime.pc_factory().create_peer_connection(rtc_config.clone())?,
+                let publisher_pc = prepare_peer_transport(
+                    Arc::clone(&lk_runtime),
+                    rtc_config.clone(),
                     proto::SignalTarget::Publisher,
                     single_pc_mode,
-                );
+                )
+                .await?;
                 let dcs = Self::create_data_channels(&publisher_pc, &emitter)?;
                 (publisher_pc, dcs.0, dcs.1, dcs.2)
             };
@@ -613,11 +767,15 @@ impl RtcSession {
         let mut subscriber_pc = if single_pc_mode {
             None
         } else {
-            Some(PeerTransport::new(
-                lk_runtime.pc_factory().create_peer_connection(rtc_config)?,
-                proto::SignalTarget::Subscriber,
-                false,
-            ))
+            Some(
+                prepare_peer_transport(
+                    Arc::clone(&lk_runtime),
+                    rtc_config,
+                    proto::SignalTarget::Subscriber,
+                    false,
+                )
+                .await?,
+            )
         };
 
         // Forward events received inside the signaling thread to our rtc channel
@@ -641,8 +799,8 @@ impl RtcSession {
             has_published: Default::default(),
             fast_publish: AtomicBool::new(join_response.fast_publish),
             signal_client,
-            publisher_pc,
-            subscriber_pc,
+            publisher_pc: publisher_pc.adopt(),
+            subscriber_pc: subscriber_pc.map(UncommittedPeer::adopt),
             single_pc_mode,
             mid_to_track_id: Mutex::new(HashMap::new()),
             dispatched_streams: Mutex::new(HashSet::new()),
@@ -2497,33 +2655,11 @@ impl SessionInner {
     }
 
     fn queue_negotiation(self: &Arc<Self>) {
-        let mut state = self.negotiation_queue.state.lock();
-
-        match *state {
-            NegotiationState::Idle => {
-                if self.negotiation_queue.task_running.swap(true, Ordering::AcqRel) {
-                    log::debug!("queue_negotiation: task already running, marking for retry");
-                    *state = NegotiationState::PendingRetry;
-                    return;
-                }
-
-                log::debug!("queue_negotiation: starting new negotiation");
-                *state = NegotiationState::InProgress;
-                drop(state);
-
-                let session = self.clone();
-                tokio::spawn(async move {
-                    session.execute_negotiation_with_retry().await;
-                    session.negotiation_queue.task_running.store(false, Ordering::Release);
-                });
-            }
-            NegotiationState::InProgress => {
-                log::debug!("queue_negotiation: marking for retry");
-                *state = NegotiationState::PendingRetry;
-            }
-            NegotiationState::PendingRetry => {
-                log::debug!("queue_negotiation: already pending retry");
-            }
+        if self.negotiation_queue.claim_task() {
+            let session = self.clone();
+            tokio::spawn(async move {
+                session.execute_negotiation_with_retry().await;
+            });
         }
     }
 
@@ -2554,20 +2690,12 @@ impl SessionInner {
                 }
             }
 
-            let mut state = self.negotiation_queue.state.lock();
-            match *state {
-                NegotiationState::PendingRetry => {
-                    log::debug!("retrying negotiation");
-                    *state = NegotiationState::InProgress;
-                    drop(state);
-                    continue;
-                }
-                _ => {
-                    log::debug!("negotiation completed");
-                    *state = NegotiationState::Idle;
-                    break;
-                }
+            if self.negotiation_queue.complete_round() {
+                log::debug!("retrying negotiation");
+                continue;
             }
+            log::debug!("negotiation completed");
+            break;
         }
     }
 
@@ -2808,7 +2936,333 @@ make_rtc_config!(make_rtc_config_reconnect, proto::ReconnectResponse);
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_sdp_max_message_size, recovery_decision, DEFAULT_MAX_MESSAGE_SIZE};
+    use super::{
+        parse_sdp_max_message_size, recovery_decision, NegotiationQueue, NegotiationState,
+        DEFAULT_MAX_MESSAGE_SIZE,
+    };
+
+    /// A native constructor must not occupy the executor needed by other rooms.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn native_peer_preparation_allows_progress_while_constructor_is_blocked() {
+        let (entered, constructor_entered) = tokio::sync::oneshot::channel();
+        let (release, constructor_release) = std::sync::mpsc::channel();
+        let constructor = tokio::spawn(async move {
+            super::prepare_native_connection(move || {
+                let _ = entered.send(());
+                // A finite deadlock bound, not a readiness sleep or retry.
+                Ok(constructor_release.recv_timeout(std::time::Duration::from_secs(5)).is_ok())
+            })
+            .await
+        });
+        constructor_entered.await.expect("native constructor entered");
+        let reader = tokio::spawn(async move { release.send(()).is_ok() });
+        let released_by_reader =
+            constructor.await.expect("join native preparation").expect("native preparation result");
+        let release_delivered = reader.await.expect("join unrelated room reader");
+        assert!(
+            released_by_reader && release_delivered,
+            "native connection preparation must yield to an unrelated room reader"
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    mod native_preparation {
+        use std::{
+            future::{poll_fn, Future},
+            sync::{
+                atomic::{AtomicUsize, Ordering},
+                Arc,
+            },
+            task::Poll,
+            time::Duration,
+        };
+
+        use super::super::{
+            prepare_native_connection_with_admission, prepare_peer_transport, EngineError,
+            EngineResult, LkRuntime, NativePreparationTask, UncommittedPeer,
+        };
+        use libwebrtc::{
+            peer_connection::PeerConnectionState, peer_connection_factory::RtcConfiguration,
+            RtcError, RtcErrorType,
+        };
+        use tokio::{runtime::Builder, sync::Semaphore};
+
+        /// Model a native resource which requires explicit close, not bare Drop.
+        struct TrackedPeer {
+            _owner: Arc<()>,
+            closes: Arc<AtomicUsize>,
+        }
+
+        impl TrackedPeer {
+            /// Observe the guard's actual close call independently of resource Drop.
+            fn close(&self) {
+                self.closes.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        /// Put a tracked resource into the same uncommitted guard as real peers.
+        fn tracked_peer(owner: Arc<()>, closes: Arc<AtomicUsize>) -> UncommittedPeer<TrackedPeer> {
+            UncommittedPeer::new(TrackedPeer { _owner: owner, closes }, TrackedPeer::close, None)
+        }
+
+        /// Cancellation while waiting for admission must never start native work.
+        #[tokio::test]
+        async fn native_peer_cancellation_before_admission_does_not_construct() {
+            let admission = Arc::new(Semaphore::new(1));
+            let held = admission.clone().acquire_owned().await.expect("hold constructor admission");
+            let calls = Arc::new(AtomicUsize::new(0));
+            let constructor_calls = calls.clone();
+            let mut pending =
+                Box::pin(prepare_native_connection_with_admission(admission.clone(), move || {
+                    constructor_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }));
+            let waited = poll_fn(|cx| Poll::Ready(pending.as_mut().poll(cx).is_pending())).await;
+            drop(pending);
+            drop(held);
+            assert!(waited, "held admission must leave constructor pending");
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(admission.available_permits(), 1);
+        }
+
+        /// An admitted but queued blocking job must be aborted before it constructs.
+        #[test]
+        fn native_peer_cancellation_aborts_queued_blocking_constructor() {
+            let runtime = Builder::new_current_thread()
+                .enable_all()
+                .max_blocking_threads(1)
+                .build()
+                .expect("queued constructor runtime");
+            let (entered, blocker_entered) = std::sync::mpsc::channel();
+            let (release, blocker_release) = std::sync::mpsc::channel();
+            let blocker = runtime.spawn_blocking(move || {
+                entered.send(()).expect("announce occupied blocking slot");
+                blocker_release
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("release blocking slot");
+            });
+            blocker_entered.recv_timeout(Duration::from_secs(5)).expect("occupied blocking slot");
+            let admission = Arc::new(Semaphore::new(1));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let constructor_calls = calls.clone();
+            let (waited, admitted) = runtime.block_on(async {
+                let mut pending = Box::pin(prepare_native_connection_with_admission(
+                    admission.clone(),
+                    move || {
+                        constructor_calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                ));
+                let waited =
+                    poll_fn(|cx| Poll::Ready(pending.as_mut().poll(cx).is_pending())).await;
+                let admitted = admission.available_permits() == 0;
+                drop(pending);
+                release.send(()).expect("release occupied blocking slot");
+                blocker.await.expect("join blocking-slot owner");
+                let returned =
+                    tokio::time::timeout(Duration::from_secs(5), admission.clone().acquire_owned())
+                        .await
+                        .expect("aborted queued job releases admission")
+                        .expect("open constructor admission");
+                drop(returned);
+                (waited, admitted)
+            });
+            drop(runtime);
+            assert!(waited && admitted, "the canceled job must have been queued after admission");
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(admission.available_permits(), 1);
+        }
+
+        /// Caller cancellation retains started inputs until normal runtime shutdown joins them.
+        #[test]
+        fn native_peer_started_cancellation_settles_before_runtime_shutdown_returns() {
+            let runtime = Builder::new_current_thread()
+                .enable_all()
+                .max_blocking_threads(1)
+                .build()
+                .expect("started constructor runtime");
+            let owner = Arc::new(());
+            let weak_owner = Arc::downgrade(&owner);
+            let closes = Arc::new(AtomicUsize::new(0));
+            let constructor_closes = closes.clone();
+            let (entered, constructor_entered) = tokio::sync::oneshot::channel();
+            let (release, constructor_release) = std::sync::mpsc::channel();
+            let (waited, retained, not_closed) = runtime.block_on(async {
+                let mut pending = Box::pin(prepare_native_connection_with_admission(
+                    Arc::new(Semaphore::new(1)),
+                    move || {
+                        entered.send(()).expect("announce started constructor");
+                        constructor_release
+                            .recv_timeout(Duration::from_secs(5))
+                            .expect("release started constructor");
+                        Ok(tracked_peer(owner, constructor_closes))
+                    },
+                ));
+                let waited =
+                    poll_fn(|cx| Poll::Ready(pending.as_mut().poll(cx).is_pending())).await;
+                constructor_entered.await.expect("constructor has started");
+                drop(pending);
+                (waited, weak_owner.upgrade().is_some(), closes.load(Ordering::SeqCst) == 0)
+            });
+            let (shutdown_started, started) = std::sync::mpsc::channel();
+            let (shutdown_done, done) = std::sync::mpsc::channel();
+            let shutdown_closes = closes.clone();
+            let shutdown = std::thread::spawn(move || {
+                shutdown_started.send(()).expect("announce normal runtime shutdown");
+                drop(runtime);
+                shutdown_done
+                    .send(shutdown_closes.load(Ordering::SeqCst))
+                    .expect("report joined native close");
+            });
+            started.recv_timeout(Duration::from_secs(5)).expect("runtime shutdown started");
+            let shutdown_pending =
+                matches!(done.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty));
+            release.send(()).expect("release runtime-owned native constructor");
+            shutdown.join().expect("join runtime shutdown owner");
+            let closed_before_shutdown_return = done.recv().expect("normal shutdown completion");
+            assert!(
+                waited && retained && not_closed,
+                "caller Drop does not join started native work"
+            );
+            assert!(shutdown_pending, "normal shutdown must not abandon the blocked constructor");
+            assert_eq!(closed_before_shutdown_return, 1);
+            assert!(weak_owner.upgrade().is_none(), "joined constructor must release owned inputs");
+        }
+
+        /// Dropping a completed, unconsumed task result must close its prepared peer.
+        #[test]
+        fn native_peer_unconsumed_completed_output_is_closed() {
+            let runtime = Builder::new_current_thread()
+                .enable_all()
+                .max_blocking_threads(1)
+                .build()
+                .expect("unconsumed result runtime");
+            let owner = Arc::new(());
+            let weak_owner = Arc::downgrade(&owner);
+            let closes = Arc::new(AtomicUsize::new(0));
+            let constructor_closes = closes.clone();
+            let pending = NativePreparationTask {
+                task: runtime.spawn_blocking(move || Ok(tracked_peer(owner, constructor_closes))),
+            };
+            // With one blocking slot this second job starts only after the first
+            // result has been stored, without polling or consuming that result.
+            runtime.block_on(runtime.spawn_blocking(|| ())).expect("join blocking-pool barrier");
+            let completed = pending.task.is_finished();
+            drop(pending);
+            drop(runtime);
+            assert!(completed, "the owned output must be ready before its caller is dropped");
+            assert_eq!(closes.load(Ordering::SeqCst), 1);
+            assert!(weak_owner.upgrade().is_none());
+        }
+
+        /// Adoption transfers ownership without premature close; adjacent errors still close.
+        #[tokio::test]
+        async fn native_peer_adoption_and_setup_errors_preserve_ownership() {
+            let owner = Arc::new(());
+            let weak_owner = Arc::downgrade(&owner);
+            let closes = Arc::new(AtomicUsize::new(0));
+            let constructor_closes = closes.clone();
+            let peer =
+                prepare_native_connection_with_admission(Arc::new(Semaphore::new(1)), move || {
+                    Ok(tracked_peer(owner, constructor_closes))
+                })
+                .await
+                .expect("successful prepared peer")
+                .adopt();
+            assert_eq!(closes.load(Ordering::SeqCst), 0, "adoption must not close the peer");
+            peer.close();
+            drop(peer);
+            assert!(weak_owner.upgrade().is_none());
+            assert_eq!(closes.load(Ordering::SeqCst), 1);
+
+            let adjacent_closes = closes.clone();
+            let result: EngineResult<()> = async {
+                let _uncommitted = prepare_native_connection_with_admission(
+                    Arc::new(Semaphore::new(1)),
+                    move || Ok(tracked_peer(Arc::new(()), adjacent_closes)),
+                )
+                .await?;
+                Err(EngineError::Connection("exact adjacent setup failure".into()))
+            }
+            .await;
+            assert!(
+                matches!(result, Err(EngineError::Connection(message)) if message == "exact adjacent setup failure")
+            );
+            assert_eq!(closes.load(Ordering::SeqCst), 2, "setup failure closes unadopted peer");
+        }
+
+        /// Preserve the native error variant and body, but never expose JoinError panic text.
+        #[tokio::test]
+        async fn native_peer_constructor_error_is_exact_and_task_failure_is_fixed() {
+            let result: EngineResult<()> =
+                prepare_native_connection_with_admission(Arc::new(Semaphore::new(1)), || {
+                    Err(EngineError::Rtc(RtcError {
+                        error_type: RtcErrorType::InvalidState,
+                        message: "exact native constructor failure".into(),
+                    }))
+                })
+                .await;
+            assert!(
+                matches!(result, Err(EngineError::Rtc(error)) if error.error_type == RtcErrorType::InvalidState && error.message == "exact native constructor failure")
+            );
+            let panicked: EngineResult<()> =
+                prepare_native_connection_with_admission(Arc::new(Semaphore::new(1)), || {
+                    panic!("test panic body must not enter EngineError")
+                })
+                .await;
+            assert!(
+                matches!(panicked, Err(EngineError::Internal(message)) if message == "native peer preparation task failed")
+            );
+        }
+
+        /// A real partially initialized native peer must be explicitly closed before adoption.
+        #[tokio::test]
+        async fn native_peer_partial_initialization_closes_the_real_connection() {
+            let runtime = LkRuntime::instance();
+            for _ in 0..5 {
+                let peer = prepare_peer_transport(
+                    runtime.clone(),
+                    RtcConfiguration::default(),
+                    livekit_protocol::SignalTarget::Publisher,
+                    false,
+                )
+                .await
+                .expect("prepare real native peer without signaling");
+                let observer = peer.peer_connection();
+                assert!(Arc::ptr_eq(peer._runtime.as_ref().expect("guard owns runtime"), &runtime));
+                drop(peer);
+                assert_eq!(observer.connection_state(), PeerConnectionState::Closed);
+                drop(observer);
+            }
+        }
+    }
+
+    #[test]
+    fn completed_negotiation_cannot_strand_the_next_task() {
+        let queue = NegotiationQueue::new();
+        assert!(queue.claim_task());
+        assert!(!queue.complete_round());
+        // Reproduce an incoming request after Idle becomes visible, but before
+        // the exiting async task executes its old trailing task_running clear.
+        assert!(
+            queue.claim_task(),
+            "a request after completion must own a new task, not wait on an exiting owner"
+        );
+        assert!(matches!(*queue.state.lock(), NegotiationState::InProgress));
+    }
+
+    #[test]
+    fn in_flight_negotiation_requests_coalesce_into_one_followup_round() {
+        let queue = NegotiationQueue::new();
+        assert!(queue.claim_task());
+        assert!(!queue.claim_task());
+        assert!(!queue.claim_task());
+        assert!(queue.complete_round());
+        assert!(matches!(*queue.state.lock(), NegotiationState::InProgress));
+        assert!(!queue.complete_round());
+        assert!(matches!(*queue.state.lock(), NegotiationState::Idle));
+    }
 
     /// `(connected, disconnect)` counts as sampled before a resume, for readability below.
     const SNAPSHOT: Option<(u32, u32)> = Some((7, 3));
