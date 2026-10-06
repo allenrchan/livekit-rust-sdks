@@ -245,23 +245,47 @@ impl AudioFrameQueue {
     }
 
     fn push_bounded(&self, queue: &BoundedAudioFrameQueue, mut frame: QueuedAudioFrame) {
+        let mut producer = queue.producer.lock();
         loop {
-            let push_result = queue.producer.lock().push(frame);
+            let push_result = producer.push(frame);
             match push_result {
                 Ok(()) => return,
                 Err(PushError::Full(returned_frame)) => {
-                    frame = returned_frame;
-
-                    let dropped = queue.consumer.lock().pop().is_ok();
-
-                    if dropped {
-                        self.record_drop();
-                    } else {
-                        return;
+                    let mut consumer = queue.consumer.lock();
+                    match self.resolve_bounded_overflow(
+                        &mut producer,
+                        &mut consumer,
+                        returned_frame,
+                    ) {
+                        Some(retained_frame) => frame = retained_frame,
+                        None => return,
                     }
                 }
             }
         }
+    }
+
+    /// Resolves a full observation while both ring-buffer owners are held.
+    fn resolve_bounded_overflow(
+        &self,
+        producer: &mut Producer<QueuedAudioFrame>,
+        consumer: &mut Consumer<QueuedAudioFrame>,
+        frame: QueuedAudioFrame,
+    ) -> Option<QueuedAudioFrame> {
+        if self.closed.load(Ordering::Acquire) {
+            return None;
+        }
+        // The async reader can free capacity after the first Full observation
+        // but before this consumer lock is acquired. Retry with both owners
+        // held: only a still-full queue may evict an unconsumed frame.
+        let frame = match producer.push(frame) {
+            Ok(()) => return None,
+            Err(PushError::Full(frame)) => frame,
+        };
+        if consumer.pop().is_ok() {
+            self.record_drop();
+        }
+        Some(frame)
     }
 
     fn close(&self) {
@@ -344,7 +368,7 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
-    use super::AudioFrameQueue;
+    use super::{AudioFrameQueue, AudioFrameQueueKind, QueuedAudioFrame};
     use crate::audio_frame::AudioFrame;
 
     fn test_frame(marker: i16) -> AudioFrame<'static> {
@@ -456,6 +480,77 @@ mod tests {
         assert_eq!(queue.dropped_frames.load(Ordering::Relaxed), 1);
         assert_eq!(pop_marker(&queue), Some(2));
         assert_eq!(pop_marker(&queue), Some(3));
+        assert_eq!(pop_marker(&queue), None);
+    }
+
+    #[test]
+    fn bounded_queue_preserves_frames_when_the_reader_frees_a_full_queue() {
+        assert_reader_frees_full_queue(1);
+    }
+
+    #[test]
+    fn bounded_queue_preserves_the_new_frame_when_the_reader_empties_a_full_queue() {
+        assert_reader_frees_full_queue(8);
+    }
+
+    fn assert_reader_frees_full_queue(consumed_count: i16) {
+        let queue = AudioFrameQueue::new(Some(8));
+        for marker in 1..=8 {
+            queue.push(test_frame(marker));
+        }
+        let AudioFrameQueueKind::Bounded(bounded) = &queue.kind else {
+            unreachable!("the fixture owns a bounded queue");
+        };
+        let mut producer = bounded.producer.lock();
+        let Err(rtrb::PushError::Full(pending)) = producer.push(QueuedAudioFrame {
+            frame: test_frame(9),
+            received_at: std::time::Instant::now(),
+        }) else {
+            panic!("the initial observation must be full");
+        };
+        // Model the async reader between the callback's initial Full and
+        // acquiring the consumer. No timing or thread scheduling is needed.
+        for marker in 1..=consumed_count {
+            assert_eq!(pop_marker(&queue), Some(marker));
+        }
+        let mut consumer = bounded.consumer.lock();
+        if let Some(frame) = queue.resolve_bounded_overflow(&mut producer, &mut consumer, pending) {
+            assert!(producer.push(frame).is_ok());
+        }
+        drop(consumer);
+        drop(producer);
+        assert_eq!(queue.dropped_frames(), 0, "available capacity must prevent eviction");
+        for marker in consumed_count + 1..=9 {
+            assert_eq!(
+                pop_marker(&queue),
+                Some(marker),
+                "every unconsumed frame stays in FIFO order"
+            );
+        }
+        assert_eq!(pop_marker(&queue), None);
+    }
+
+    #[test]
+    fn close_during_overflow_does_not_publish_or_count_the_pending_frame() {
+        let queue = AudioFrameQueue::new(Some(1));
+        queue.push(test_frame(1));
+        let AudioFrameQueueKind::Bounded(bounded) = &queue.kind else {
+            unreachable!("the fixture owns a bounded queue");
+        };
+        let mut producer = bounded.producer.lock();
+        let Err(rtrb::PushError::Full(pending)) = producer.push(QueuedAudioFrame {
+            frame: test_frame(2),
+            received_at: std::time::Instant::now(),
+        }) else {
+            panic!("the initial observation must be full");
+        };
+        queue.close();
+        let mut consumer = bounded.consumer.lock();
+        assert!(queue.resolve_bounded_overflow(&mut producer, &mut consumer, pending).is_none());
+        drop(consumer);
+        drop(producer);
+        assert_eq!(queue.dropped_frames(), 0);
+        assert_eq!(queue.stats_at(std::time::Instant::now()).queued_frames, 0);
         assert_eq!(pop_marker(&queue), None);
     }
 
