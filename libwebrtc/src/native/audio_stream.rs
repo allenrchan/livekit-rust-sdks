@@ -30,7 +30,8 @@ use tokio_stream::Stream;
 use webrtc_sys::audio_track as sys_at;
 
 use crate::{
-    audio_frame::AudioFrame, audio_stream::native::NativeAudioStreamQueueStats,
+    audio_frame::AudioFrame,
+    audio_stream::native::{NativeAudioStreamOverflowStats, NativeAudioStreamQueueStats},
     audio_track::RtcAudioTrack,
 };
 
@@ -73,6 +74,11 @@ impl NativeAudioStream {
     /// Observes decoded callback cadence and frame queue residence.
     pub fn queue_stats(&self) -> NativeAudioStreamQueueStats {
         self.frame_queue.stats_at(Instant::now())
+    }
+
+    /// Observes ages of frames discarded by decoded queue overflow.
+    pub fn overflow_stats(&self) -> NativeAudioStreamOverflowStats {
+        self.frame_queue.overflow_stats()
     }
 
     pub fn close(&mut self) {
@@ -126,6 +132,8 @@ struct AudioFrameQueue {
     last_callback_offset_ns: AtomicU64,
     max_callback_gap_ns: AtomicU64,
     max_frame_residence_ns: AtomicU64,
+    last_evicted_frame_age_ns: AtomicU64,
+    max_evicted_frame_age_ns: AtomicU64,
     waker: Mutex<Option<Waker>>,
 }
 
@@ -150,6 +158,17 @@ struct UnboundedAudioFrameQueue {
 }
 
 impl AudioFrameQueue {
+    /// Samples discarded-frame ages without removing or resetting frames.
+    fn overflow_stats(&self) -> NativeAudioStreamOverflowStats {
+        let last_age = self.last_evicted_frame_age_ns.load(Ordering::Relaxed);
+        let max_age = self.max_evicted_frame_age_ns.load(Ordering::Relaxed);
+        NativeAudioStreamOverflowStats {
+            dropped_frames: self.dropped_frames(),
+            last_evicted_frame_age_ms: last_age.checked_sub(1).map(|ns| ns / 1_000_000),
+            max_evicted_frame_age_ms: max_age.checked_sub(1).map(|ns| ns / 1_000_000),
+        }
+    }
+
     /// Samples counters and current backlog without removing a frame.
     fn stats_at(&self, now: Instant) -> NativeAudioStreamQueueStats {
         let (queued_frames, oldest_received_at) = match &self.kind {
@@ -203,6 +222,8 @@ impl AudioFrameQueue {
             last_callback_offset_ns: AtomicU64::new(0),
             max_callback_gap_ns: AtomicU64::new(0),
             max_frame_residence_ns: AtomicU64::new(0),
+            last_evicted_frame_age_ns: AtomicU64::new(0),
+            max_evicted_frame_age_ns: AtomicU64::new(0),
             waker: Mutex::new(None),
         }
     }
@@ -272,6 +293,19 @@ impl AudioFrameQueue {
         consumer: &mut Consumer<QueuedAudioFrame>,
         frame: QueuedAudioFrame,
     ) -> Option<QueuedAudioFrame> {
+        // Sample after both owners are acquired, so lock wait is not excluded
+        // from the age of a frame that is actually discarded.
+        self.resolve_bounded_overflow_at(producer, consumer, frame, Instant::now())
+    }
+
+    /// Resolves overflow at a controlled monotonic instant.
+    fn resolve_bounded_overflow_at(
+        &self,
+        producer: &mut Producer<QueuedAudioFrame>,
+        consumer: &mut Consumer<QueuedAudioFrame>,
+        frame: QueuedAudioFrame,
+        now: Instant,
+    ) -> Option<QueuedAudioFrame> {
         if self.closed.load(Ordering::Acquire) {
             return None;
         }
@@ -282,7 +316,13 @@ impl AudioFrameQueue {
             Ok(()) => return None,
             Err(PushError::Full(frame)) => frame,
         };
-        if consumer.pop().is_ok() {
+        if let Ok(evicted) = consumer.pop() {
+            // Zero denotes no eviction; an actual zero-age eviction is one.
+            // The producer lock serializes evictions without a new lock or
+            // another PCM owner. Shutdown never calls this observation path.
+            let age = elapsed_ns(evicted.received_at, now).saturating_add(1);
+            self.max_evicted_frame_age_ns.fetch_max(age, Ordering::Relaxed);
+            self.last_evicted_frame_age_ns.store(age, Ordering::Relaxed);
             self.record_drop();
         }
         Some(frame)
@@ -382,6 +422,85 @@ mod tests {
 
     fn pop_marker(queue: &AudioFrameQueue) -> Option<i16> {
         queue.try_pop().map(|frame| frame.data[0])
+    }
+
+    #[test]
+    fn overflow_stats_measure_evicted_age_without_delivering_or_consuming_frames() {
+        let _public_observation: fn(
+            &crate::audio_stream::native::NativeAudioStream,
+        )
+            -> crate::audio_stream::native::NativeAudioStreamOverflowStats =
+            crate::audio_stream::native::NativeAudioStream::overflow_stats;
+        let queue = AudioFrameQueue::new(Some(1));
+        let clock = queue.started_at;
+        assert_eq!(queue.overflow_stats().last_evicted_frame_age_ms, None);
+        queue.push_at(test_frame(1), clock);
+        let AudioFrameQueueKind::Bounded(bounded) = &queue.kind else {
+            unreachable!("the fixture owns a bounded queue");
+        };
+        let mut producer = bounded.producer.lock();
+        let mut consumer = bounded.consumer.lock();
+        let frame = QueuedAudioFrame {
+            frame: test_frame(2),
+            received_at: clock + Duration::from_millis(100),
+        };
+        let pending = queue
+            .resolve_bounded_overflow_at(
+                &mut producer,
+                &mut consumer,
+                frame,
+                clock + Duration::from_millis(100),
+            )
+            .expect("a full queue must retain the new frame after eviction");
+        assert!(producer.push(pending).is_ok());
+        drop(consumer);
+        drop(producer);
+        let observed = queue.overflow_stats();
+        assert_eq!(observed.dropped_frames, 1);
+        assert_eq!(observed.last_evicted_frame_age_ms, Some(100));
+        assert_eq!(observed.max_evicted_frame_age_ms, Some(100));
+        let delivered = queue.stats_at(clock + Duration::from_millis(100));
+        assert_eq!(delivered.delivered_frames, 0);
+        assert_eq!(delivered.max_frame_residence_ms, 0);
+        assert_eq!(delivered.queued_frames, 1);
+        assert_eq!(queue.try_pop_at(clock + Duration::from_millis(100)).unwrap().data[0], 2);
+        assert_eq!(queue.overflow_stats(), observed, "reading must not reset overflow ages");
+        queue.close();
+        assert_eq!(queue.overflow_stats(), observed, "shutdown must not reset overflow ages");
+    }
+
+    #[test]
+    fn overflow_stats_distinguish_fresh_eviction_from_no_eviction_and_keep_peak_age() {
+        let queue = AudioFrameQueue::new(Some(1));
+        let clock = queue.started_at;
+        assert_eq!(queue.overflow_stats().max_evicted_frame_age_ms, None);
+        queue.push_at(test_frame(1), clock);
+        let AudioFrameQueueKind::Bounded(bounded) = &queue.kind else {
+            unreachable!("the fixture owns a bounded queue");
+        };
+        let mut producer = bounded.producer.lock();
+        let mut consumer = bounded.consumer.lock();
+        let now = clock + Duration::from_millis(100);
+        for marker in [2, 3] {
+            let pending = queue
+                .resolve_bounded_overflow_at(
+                    &mut producer,
+                    &mut consumer,
+                    QueuedAudioFrame { frame: test_frame(marker), received_at: now },
+                    now,
+                )
+                .expect("a still-full queue must retain the incoming frame");
+            assert!(producer.push(pending).is_ok());
+        }
+        drop(consumer);
+        drop(producer);
+        let observed = queue.overflow_stats();
+        assert_eq!(observed.dropped_frames, 2);
+        assert_eq!(observed.last_evicted_frame_age_ms, Some(0));
+        assert_eq!(observed.max_evicted_frame_age_ms, Some(100));
+        assert_eq!(pop_marker(&queue), Some(3));
+        assert_eq!(pop_marker(&queue), None);
+        assert_eq!(queue.overflow_stats(), observed);
     }
 
     #[test]
@@ -520,6 +639,8 @@ mod tests {
         drop(consumer);
         drop(producer);
         assert_eq!(queue.dropped_frames(), 0, "available capacity must prevent eviction");
+        assert_eq!(queue.overflow_stats().last_evicted_frame_age_ms, None);
+        assert_eq!(queue.overflow_stats().max_evicted_frame_age_ms, None);
         for marker in consumed_count + 1..=9 {
             assert_eq!(
                 pop_marker(&queue),
@@ -550,6 +671,8 @@ mod tests {
         drop(consumer);
         drop(producer);
         assert_eq!(queue.dropped_frames(), 0);
+        assert_eq!(queue.overflow_stats().last_evicted_frame_age_ms, None);
+        assert_eq!(queue.overflow_stats().max_evicted_frame_age_ms, None);
         assert_eq!(queue.stats_at(std::time::Instant::now()).queued_frames, 0);
         assert_eq!(pop_marker(&queue), None);
     }
@@ -587,6 +710,8 @@ mod tests {
         }
         assert_eq!(pop_marker(&queue), None);
         assert_eq!(queue.dropped_frames.load(Ordering::Relaxed), 0);
+        assert_eq!(queue.overflow_stats().last_evicted_frame_age_ms, None);
+        assert_eq!(queue.overflow_stats().max_evicted_frame_age_ms, None);
     }
 
     #[test]
@@ -598,5 +723,7 @@ mod tests {
         queue.push(test_frame(2));
 
         assert_eq!(pop_marker(&queue), None);
+        assert_eq!(queue.overflow_stats().last_evicted_frame_age_ms, None);
+        assert_eq!(queue.overflow_stats().max_evicted_frame_age_ms, None);
     }
 }
