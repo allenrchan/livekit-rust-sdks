@@ -72,6 +72,22 @@ pub mod native {
         pub last_callback_age_ms: Option<u64>,
     }
 
+    /// Stream-local ages of frames discarded by decoded queue overflow.
+    ///
+    /// Fields are sampled independently while capture may continue. Ages use
+    /// the process monotonic clock from callback arrival to eviction, not RTP
+    /// timestamps. They exclude reader delivery and explicit shutdown.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub struct NativeAudioStreamOverflowStats {
+        /// Cumulative frames discarded by overflow, excluding shutdown.
+        pub dropped_frames: u64,
+        /// Age at the latest eviction; absent before any overflow eviction.
+        pub last_evicted_frame_age_ms: Option<u64>,
+        /// Greatest age at eviction; absent before any overflow eviction.
+        pub max_evicted_frame_age_ms: Option<u64>,
+    }
+
     pub struct NativeAudioStream {
         pub(crate) handle: stream_imp::NativeAudioStream,
     }
@@ -128,6 +144,17 @@ pub mod native {
         #[must_use]
         pub fn queue_stats(&self) -> NativeAudioStreamQueueStats {
             self.handle.queue_stats()
+        }
+
+        /// Observes discarded-frame ages without consuming PCM or resetting counters.
+        ///
+        /// [`Self::queue_stats`] reports delivered-frame residence; these ages
+        /// describe frames that never reached the reader. Values remain after
+        /// draining or [`Self::close`]. A fresh burst may evict frames aged zero
+        /// milliseconds, which is distinct from no eviction.
+        #[must_use]
+        pub fn overflow_stats(&self) -> NativeAudioStreamOverflowStats {
+            self.handle.overflow_stats()
         }
 
         pub fn close(&mut self) {
