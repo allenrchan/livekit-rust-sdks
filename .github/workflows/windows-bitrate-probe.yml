@@ -1,0 +1,96 @@
+name: Isolated Windows bitrate diagnostic
+
+on:
+  push:
+    branches: [allenrchan/sdk-windows-bitrate-probe]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bitrate:
+    if: github.repository == 'allenrchan/livekit-rust-sdks'
+    name: Bitrate (${{ matrix.label }})
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: upstream
+            source: 3c688ad6f1f587b9cff052dea2b44cd484ce7228
+          - label: pr1531-ci-merge
+            source: 892d4d0dfc581570718593927b4f5b8350ddb6e0
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      CARGO_TARGET_DIR: target
+      RUST_BACKTRACE: full
+      RUST_LOG: info
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: livekit/rust-sdks
+          ref: ${{ matrix.source }}
+          submodules: true
+          persist-credentials: false
+
+      - name: Setup matching Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          toolchain: 1.97.1
+          target: x86_64-pc-windows-msvc
+          cache: false
+          rustflags: ''
+
+      - name: Record immutable source and toolchain
+        env:
+          EXPECTED_SOURCE: ${{ matrix.source }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bitrate-proof"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE"
+          {
+            git rev-parse HEAD
+            git rev-parse HEAD:libwebrtc/src/native/peer_connection.rs
+            git rev-parse HEAD:webrtc-sys/src/peer_connection.cpp
+            rustup run 1.97.1 rustc -Vv
+            rustup run 1.97.1 cargo -V
+          } | tee "$RUNNER_TEMP/bitrate-proof/source.txt"
+
+      # This native unit test needs neither the signaling client nor a server.
+      # Match the failing job's libwebrtc features, but do not restore any cache.
+      - name: Execute exact bitrate case once
+        run: |
+          set -euo pipefail
+          unset RUSTC_WRAPPER CC CXX LK_CUSTOM_WEBRTC LK_DEBUG_WEBRTC
+          rustup run 1.97.1 cargo test --locked \
+            --target x86_64-pc-windows-msvc \
+            -p libwebrtc --features glib-main-loop --lib \
+            imp::peer_connection::tests::set_bitrate \
+            -- --exact --nocapture --test-threads=1 \
+            2>&1 | tee "$RUNNER_TEMP/bitrate-proof/exact.log"
+
+      - name: Execute original libwebrtc case order once
+        run: |
+          set -euo pipefail
+          unset RUSTC_WRAPPER CC CXX LK_CUSTOM_WEBRTC LK_DEBUG_WEBRTC
+          rustup run 1.97.1 cargo test --locked \
+            --target x86_64-pc-windows-msvc \
+            -p libwebrtc --features glib-main-loop --lib \
+            -- --nocapture --test-threads=1 \
+            2>&1 | tee "$RUNNER_TEMP/bitrate-proof/library.log"
+
+      - name: Retain bounded diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-bitrate-${{ matrix.label }}
+          path: ${{ runner.temp }}/bitrate-proof/
+          if-no-files-found: warn
+          retention-days: 7
