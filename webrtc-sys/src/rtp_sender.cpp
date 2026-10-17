@@ -149,11 +149,17 @@ RtpSender::RtpSender(
       peer_connection_(std::move(peer_connection)) {}
 
 bool RtpSender::set_track(std::shared_ptr<MediaStreamTrack> track) const {
-  return sender_->SetTrack(track->rtc_track().get());
+  // Rust None maps to an empty shared_ptr; WebRTC uses nullptr to clear a track.
+  return sender_->SetTrack(track ? track->rtc_track().get() : nullptr);
 }
 
 std::shared_ptr<MediaStreamTrack> RtpSender::track() const {
-  return rtc_runtime_->get_or_create_media_stream_track(sender_->track());
+  // RemoveTrack legitimately leaves the sender without a track. Preserve the
+  // Rust API's None result instead of passing null to the native track wrapper.
+  auto track = sender_->track();
+  if (!track)
+    return nullptr;
+  return rtc_runtime_->get_or_create_media_stream_track(track);
 }
 
 uint32_t RtpSender::ssrc() const {

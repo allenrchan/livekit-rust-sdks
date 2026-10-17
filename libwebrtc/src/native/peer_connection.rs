@@ -643,10 +643,55 @@ impl sys_pcf::PeerConnectionObserver for PeerObserver {
 #[cfg(test)]
 mod tests {
     use crate::{
+        audio_source::{native::NativeAudioSource, AudioSourceOptions},
         peer_connection::BitrateSettings,
-        peer_connection_factory::{PeerConnectionFactory, RtcConfiguration},
+        peer_connection_factory::{
+            native::PeerConnectionFactoryExt, PeerConnectionFactory, RtcConfiguration,
+        },
         RtcErrorType,
     };
+
+    #[test]
+    fn detached_audio_sender_reports_no_track() {
+        let factory = PeerConnectionFactory::default();
+        for _ in 0..3 {
+            let pc = factory.create_peer_connection(RtcConfiguration::default()).unwrap();
+            let source = NativeAudioSource::new(AudioSourceOptions::default(), 48_000, 1, 100);
+            let track = factory.create_audio_track("detached-audio", source);
+            let track_id = track.id();
+            let sender = pc.add_track(track.into(), &["audio-stream"]).unwrap();
+            assert_eq!(sender.track().map(|track| track.id()), Some(track_id));
+
+            pc.remove_track(sender.clone()).expect("the open peer must remove its sender");
+            let detached_track = sender.track();
+            pc.close();
+
+            assert!(detached_track.is_none(), "a detached sender must expose an absent track");
+            assert!(sender.track().is_none(), "closing must not reattach the track");
+        }
+    }
+
+    #[test]
+    fn audio_sender_can_clear_and_replace_its_track() {
+        let factory = PeerConnectionFactory::default();
+        let pc = factory.create_peer_connection(RtcConfiguration::default()).unwrap();
+        let source = NativeAudioSource::new(AudioSourceOptions::default(), 48_000, 1, 100);
+        let original = factory.create_audio_track("original-audio", source.clone());
+        let replacement = factory.create_audio_track("replacement-audio", source);
+        let replacement_id = replacement.id();
+        let sender = pc.add_track(original.into(), &["audio-stream"]).unwrap();
+
+        sender.set_track(None).expect("an open sender must allow clearing its track");
+        let cleared_track = sender.track();
+        sender
+            .set_track(Some(replacement.into()))
+            .expect("a cleared sender must allow a replacement track");
+        let restored_id = sender.track().map(|track| track.id());
+        pc.close();
+
+        assert!(cleared_track.is_none(), "clearing must preserve the public None contract");
+        assert_eq!(restored_id, Some(replacement_id));
+    }
 
     #[tokio::test]
     async fn set_bitrate() {
