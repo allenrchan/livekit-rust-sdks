@@ -1,8 +1,8 @@
-name: Isolated Windows bitrate diagnostic
+name: Windows workspace-context bitrate diagnostic
 
 on:
   push:
-    branches: [allenrchan/sdk-windows-bitrate-probe]
+    branches: [allenrchan/sdk-windows-workspace-probe]
   workflow_dispatch:
 
 permissions:
@@ -11,7 +11,7 @@ permissions:
 jobs:
   bitrate:
     if: github.repository == 'allenrchan/livekit-rust-sdks'
-    name: Bitrate (${{ matrix.label }})
+    name: Workspace bitrate (${{ matrix.label }})
     runs-on: windows-latest
     timeout-minutes: 30
     strategy:
@@ -59,38 +59,45 @@ jobs:
             git rev-parse HEAD
             git rev-parse HEAD:libwebrtc/src/native/peer_connection.rs
             git rev-parse HEAD:webrtc-sys/src/peer_connection.cpp
+            git rev-parse HEAD:Cargo.lock
             rustup run 1.97.1 rustc -Vv
             rustup run 1.97.1 cargo -V
+            printf 'ImageOS=%s\nImageVersion=%s\n' "${ImageOS:-unavailable}" "${ImageVersion:-unavailable}"
           } | tee "$RUNNER_TEMP/bitrate-proof/source.txt"
 
-      # This native unit test needs neither the signaling client nor a server.
-      # Match the failing job's libwebrtc features, but do not restore any cache.
-      - name: Execute exact bitrate case once
+      # Keep the original workspace build/feature context. Filter execution to
+      # the one native case, so no SFU-dependent E2E test is silently omitted
+      # from a claimed full-suite result. No cache restore or retries.
+      - name: Retain workspace feature context
         run: |
           set -euo pipefail
           unset RUSTC_WRAPPER CC CXX LK_CUSTOM_WEBRTC LK_DEBUG_WEBRTC
-          rustup run 1.97.1 cargo test --locked \
+          rustup run 1.97.1 cargo tree --locked \
             --target x86_64-pc-windows-msvc \
-            -p libwebrtc --features glib-main-loop --lib \
+            --features __lk-e2e-test -e features -i libwebrtc \
+            2>&1 | tee "$RUNNER_TEMP/bitrate-proof/workspace-features.log"
+
+      - name: Execute exact bitrate case in workspace context once
+        env:
+          EXPECTED_SOURCE: ${{ matrix.source }}
+        run: |
+          set -euo pipefail
+          unset RUSTC_WRAPPER CC CXX LK_CUSTOM_WEBRTC LK_DEBUG_WEBRTC
+          rustup run 1.97.1 cargo test --locked --verbose --no-fail-fast \
+            --target x86_64-pc-windows-msvc \
+            --features __lk-e2e-test \
             imp::peer_connection::tests::set_bitrate \
             -- --exact --nocapture --test-threads=1 \
-            2>&1 | tee "$RUNNER_TEMP/bitrate-proof/exact.log"
-
-      - name: Execute original libwebrtc case order once
-        run: |
-          set -euo pipefail
-          unset RUSTC_WRAPPER CC CXX LK_CUSTOM_WEBRTC LK_DEBUG_WEBRTC
-          rustup run 1.97.1 cargo test --locked \
-            --target x86_64-pc-windows-msvc \
-            -p libwebrtc --features glib-main-loop --lib \
-            -- --nocapture --test-threads=1 \
-            2>&1 | tee "$RUNNER_TEMP/bitrate-proof/library.log"
+            2>&1 | tee "$RUNNER_TEMP/bitrate-proof/workspace-case.log"
+          test "$(grep -F -c 'test imp::peer_connection::tests::set_bitrate ... ok' "$RUNNER_TEMP/bitrate-proof/workspace-case.log")" = 1
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE"
+          test -z "$(git status --porcelain)"
 
       - name: Retain bounded diagnostic logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: windows-bitrate-${{ matrix.label }}
+          name: windows-workspace-bitrate-${{ matrix.label }}
           path: ${{ runner.temp }}/bitrate-proof/
           if-no-files-found: warn
           retention-days: 7
