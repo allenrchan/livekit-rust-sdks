@@ -48,6 +48,12 @@ jobs:
           cache: false
           rustflags: ''
 
+      - name: Install matching Protoc
+        uses: arduino/setup-protoc@a8b67ba40b37d35169e222f3bb352603327985b6 # v2.1.0
+        with:
+          version: '25.2'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Record immutable source and toolchain
         env:
           EXPECTED_SOURCE: ${{ matrix.source }}
@@ -62,6 +68,7 @@ jobs:
             git rev-parse HEAD:Cargo.lock
             rustup run 1.97.1 rustc -Vv
             rustup run 1.97.1 cargo -V
+            protoc --version
             printf 'ImageOS=%s\nImageVersion=%s\n' "${ImageOS:-unavailable}" "${ImageVersion:-unavailable}"
           } | tee "$RUNNER_TEMP/bitrate-proof/source.txt"
 
