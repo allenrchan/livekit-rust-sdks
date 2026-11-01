@@ -100,9 +100,9 @@ pub fn prebuilt_dir() -> path::PathBuf {
 
 pub fn download_url() -> String {
     format!(
-        "https://github.com/livekit/rust-sdks/releases/download/{}/{}.zip",
+        "https://github.com/livekit/rust-sdks/releases/download/{}/webrtc-{}.zip",
         WEBRTC_TAG,
-        format!("webrtc-{}", webrtc_triple())
+        webrtc_triple()
     )
 }
 
@@ -235,6 +235,7 @@ pub fn download_webrtc() -> Result<()> {
         .write(true)
         .read(true)
         .create(true)
+        .truncate(true)
         .open(&tmp_path)
         .context("Failed to create temporary file for WebRTC download")?;
     resp.copy_to(&mut file).context("Failed to write WebRTC download to temporary file")?;
@@ -246,9 +247,7 @@ pub fn download_webrtc() -> Result<()> {
     let _ = fs::remove_dir_all(&tmp_extract); // clean up leftover from a crashed build
     fs::create_dir_all(&tmp_extract).context("Failed to create temp extraction dir")?;
 
-    let mut archive = zip::ZipArchive::new(file).context("Failed to open WebRTC zip archive")?;
-    archive.extract(&tmp_extract).context("Failed to extract WebRTC archive")?;
-    drop(archive);
+    extract_webrtc_archive(file, &tmp_extract)?;
 
     // The zip root is `{triple}/`, so extracted content sits at `tmp_extract/{triple}/`.
     fs::rename(tmp_extract.join(webrtc_triple()), &webrtc_dir)
@@ -259,6 +258,17 @@ pub fn download_webrtc() -> Result<()> {
     ensure_owner_readable(&webrtc_dir).context("Failed to normalize libwebrtc file permissions")?;
 
     fs::remove_file(&tmp_path).context("Failed to remove temporary WebRTC zip file")?;
+    Ok(())
+}
+
+/// Validate all ZIP headers before writing any prebuilt WebRTC files.
+fn extract_webrtc_archive<R: io::Read + io::Seek>(
+    source: R,
+    destination: &path::Path,
+) -> Result<()> {
+    let mut archive = zip::ZipArchive::new(source).context("Failed to open WebRTC zip archive")?;
+    archive.validate_header_consistency().context("Inconsistent WebRTC archive headers")?;
+    archive.extract(destination).context("Failed to extract WebRTC archive")?;
     Ok(())
 }
 
@@ -367,5 +377,71 @@ fn host_os() -> Option<&'static str> {
         Some("windows")
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod archive_tests {
+    use std::io::Cursor;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    /// Own an isolated fixture directory and remove it after each test.
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        /// Create a process-local directory without changing global environment.
+        fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let path = env::temp_dir().join(format!(
+                "livekit-prebuilt-archive-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).expect("create isolated archive fixture directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn extracts_deflated_prebuilt_layout() {
+        let temporary = TestDirectory::new();
+        let destination = temporary.0.join("extracted");
+        let bytes = include_bytes!("../tests/data/prebuilt-valid.zip");
+        extract_webrtc_archive(Cursor::new(bytes), &destination).expect("extract valid prebuilt");
+        assert_eq!(
+            fs::read(destination.join("linux-arm64-release/include/webrtc.h"))
+                .expect("read header"),
+            b"webrtc header fixture\n"
+        );
+        assert_eq!(
+            fs::read(destination.join("linux-arm64-release/LICENSE.md")).expect("read license"),
+            b"fixture license\n"
+        );
+    }
+
+    #[test]
+    fn rejects_mismatched_headers_before_writing_files() {
+        let temporary = TestDirectory::new();
+        let destination = temporary.0.join("extracted");
+        let bytes = include_bytes!("../tests/data/prebuilt-mismatched-headers.zip");
+        assert!(extract_webrtc_archive(Cursor::new(bytes), &destination).is_err());
+        assert!(!destination.exists(), "invalid archive must not start extraction");
+    }
+
+    #[test]
+    fn rejects_duplicate_names_before_writing_files() {
+        let temporary = TestDirectory::new();
+        let destination = temporary.0.join("extracted");
+        let bytes = include_bytes!("../tests/data/prebuilt-duplicate-names.zip");
+        assert!(extract_webrtc_archive(Cursor::new(bytes), &destination).is_err());
+        assert!(!destination.exists(), "shadowed entries must not start extraction");
     }
 }
